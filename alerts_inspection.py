@@ -21,15 +21,23 @@
  *                                                                         *
  ***************************************************************************/
 """
+from os.path import expanduser
+import json
+import os
+import requests as req
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, Qt
-from qgis.PyQt.QtGui import QIcon
+from qgis.PyQt.QtGui import QIcon, QPixmap
+from qgis.PyQt.QtWidgets import QAction, QFileDialog, QMessageBox
+from qgis.core import Qgis, QgsProject, QgsRasterLayer, QgsVectorLayer, QgsFillSymbol, QgsCoordinateReferenceSystem
 from qgis.PyQt.QtWidgets import QAction
 # Initialize Qt resources from file resources.py
 from .resources import *
 
 # Import the code for the DockWidget
 from .alerts_inspection_dockwidget import AlertsInspectionDockWidget
-import os.path
+from .resources import *
+from .sources import connections
+from .src.inspections import InspectionController
 
 
 class AlertsInspection:
@@ -63,7 +71,7 @@ class AlertsInspection:
 
         # Declare instance attributes
         self.actions = []
-        self.menu = self.tr(u'&Alerts Inspection Tool')
+        self.menu = self.tr(u'&Deforestation Alerts Inspection')
         # TODO: We are going to let the user set this up in a future iteration
         self.toolbar = self.iface.addToolBar(u'AlertsInspection')
         self.toolbar.setObjectName(u'AlertsInspection')
@@ -72,6 +80,16 @@ class AlertsInspection:
 
         self.pluginIsActive = False
         self.dockwidget = None
+        self.tilesLayer = None
+        self.polygonsLayer = None
+        self.workDir = None
+        self.canvas = None
+        self.root = None
+        self.group = None
+        self.tiles = None
+        self.currentTileIndex = 0
+        self.selectedClass = None
+        self.inspectionController = None
 
 
     # noinspection PyMethodMayBeStatic
@@ -180,6 +198,12 @@ class AlertsInspection:
         """Cleanup necessary items here when plugin dockwidget is closed"""
 
         #print "** CLOSING AlertsInspection"
+        QgsProject.instance().clear()
+        self.dockwidget.fieldFileName.setText("")
+        self.dockwidget.polygonsFileName.setText("")
+        self.dockwidget.interpreterName.setText("")
+        self.dockwidget.fieldWorkingDirectory.setText("")
+        self.iface.actionPan().trigger() 
 
         # disconnects
         self.dockwidget.closingPlugin.disconnect(self.onClosePlugin)
@@ -200,13 +224,160 @@ class AlertsInspection:
 
         for action in self.actions:
             self.iface.removePluginMenu(
-                self.tr(u'&Alerts Inspection Tool'),
+                self.tr(u'&Deforestation Alerts Inspection'),
                 action)
             self.iface.removeToolBarIcon(action)
         # remove the toolbar
         del self.toolbar
 
     #--------------------------------------------------------------------------
+    #                               PLUGIN CODE                               #
+    #--------------------------------------------------------------------------
+
+    def openGoogleSatellite(self):
+    
+        url = 'https://mt1.google.com/vt/lyrs=s&x=%7Bx%7D&y=%7By%7D&z=%7Bz%7D'
+        service_url = url.replace("=", "%3D").replace("&", "%26")
+        qgis_tms_uri = 'type=xyz&zmin={0}&zmax={1}&url={2}'.format(0, 19, service_url)
+
+        layer = QgsRasterLayer(qgis_tms_uri, "Google Satellite", 'wms')
+
+        if layer.isValid():
+            QgsProject.instance().addMapLayer(layer)
+        else:
+            print("Layer failed to load!")
+
+    def getConfig(self, key):
+        """Load config file and get value of key"""
+        data = None
+        with open(self.workDir + 'config.json') as json_file:
+            ob = json.load(json_file)
+            data = ob[key]
+            json_file.close()
+        return data
+
+    def setConfig(self, key, value):
+        """Write config in config file"""
+        ob = None
+        with open(self.workDir + 'config.json', 'r') as json_file:
+            ob = json.load(json_file)
+            json_file.close()
+
+        with open(self.workDir + 'config.json', 'w') as outfile:
+            ob[key] = value
+            json.dump(ob, outfile)
+            outfile.close()
+
+    def configTiles(self):
+        tile = self.tiles[self.currentTileIndex]
+        self.dockwidget.tileInfo.setText(f"Tile {self.currentTileIndex + 1} of {len(self.tiles)}")
+        self.dockwidget.btnClearSelection.setVisible(False)
+        self.inspectionController.createPointsLayer(tile)
+        self.loadClasses()
+   
+            
+    def loadTiles(self):
+        """Load tiles from layer"""
+        instance = QgsProject.instance()
+        openLayers = [layer for layer in instance.mapLayers().values()]
+        for layer in openLayers:
+            if (layer.name() == 'tiles'):
+                self.tiles = [f.attributes() for f in layer.getFeatures()]
+
+    def openTilesFile(self, fromConfig=False):
+        """Open Tiles file Dialog"""
+        QgsProject.instance().setCrs(QgsCoordinateReferenceSystem(5880))
+       
+        if (fromConfig):
+            layerPath = self.getConfig('filePath')
+            self.dockwidget.tabWidget.setCurrentIndex(1)
+            self.currentTileIndex = self.getConfig('currentTileIndex')
+        else:
+            layerPath = str(
+                QFileDialog.getOpenFileName(
+                    caption='Escolha o arquivo com os tiles',
+                    filter='Geopackage (*gpkg)'
+                )[0]
+            )
+        if (layerPath != ""):
+            self.tilesLayer = QgsVectorLayer(layerPath, 'tiles', 'ogr')
+            symbol = QgsFillSymbol.createSimple(
+                {'color': '0,0,0,0', 'color_border': 'red', 'width_border': '0.5', 'style': 'dashed'})
+            self.tilesLayer.renderer().setSymbol(symbol)
+            self.dockwidget.fieldFileName.setText(layerPath)
+            QgsProject.instance().addMapLayer(self.tilesLayer)
+            self.iface.setActiveLayer(self.tilesLayer);
+            self.iface.zoomToActiveLayer();
+            self.loadTiles()
+            self.setConfig(key='filePath', value=layerPath)
+            
+            if(fromConfig):
+                 self.configTiles()
+
+    def openPolygonsFile(self, fromConfig=False):
+        """Open Polygons file Dialog"""
+        QgsProject.instance().setCrs(QgsCoordinateReferenceSystem(5880))
+       
+        if (fromConfig):
+            layerPath = self.getConfig('polygonsFilePath')
+            self.dockwidget.tabWidget.setCurrentIndex(1)
+            self.currentTileIndex = self.getConfig('currentTileIndex')
+        else:
+            layerPath = str(
+                QFileDialog.getOpenFileName(
+                    caption='Escolha o arquivo com os polygons',
+                    filter='Geopackage (*gpkg)'
+                )[0]
+            )
+        if (layerPath != ""):
+            self.polygonsLayer = QgsVectorLayer(layerPath, 'deforestation_polygons', 'ogr')
+            symbol = QgsFillSymbol.createSimple(
+                {'color': '255,224,102,40', 'color_border': 'orange', 'width_border': '0.5', 'style': 'dashed_line'})
+            self.polygonsLayer.renderer().setSymbol(symbol)
+            self.dockwidget.polygonsFileName.setText(layerPath)
+            QgsProject.instance().addMapLayer(self.polygonsLayer)
+            self.setConfig(key='polygonsFilePath', value=layerPath)         
+
+
+    def getDirPath(self, fromConfig=False):
+        if (fromConfig):
+            dir = self.getConfig('workingDirectory')
+        else:
+            dir = QFileDialog.getExistingDirectory(
+                self.dockwidget,
+                "Select Directory",
+                expanduser("~"),
+                QFileDialog.ShowDirsOnly
+            )
+            self.dockwidget.btnInitInspections.setVisible(True)
+        self.dockwidget.fieldWorkingDirectory.setText(dir)
+        self.setConfig(key='workingDirectory', value=dir)
+
+
+    def loadClasses(self):
+        self.dockwidget.labelClass.setVisible(True)
+        self.dockwidget.selectedClass.setVisible(True)
+        self.inspectionController.initInspectionTile()
+         
+
+    def initInspections(self):
+        interpreterName =  self.dockwidget.interpreterName.text()
+        if(interpreterName != ""): 
+            self.configTiles()
+            self.dockwidget.tabWidget.setTabEnabled(1, True)
+            self.dockwidget.tabWidget.setCurrentIndex(1)
+            self.dockwidget.btnInitInspections.setVisible(False)
+            self.setTileInfoVisible(visible=True)
+            self.setConfig(key='interpreterName', value=interpreterName.upper())
+            self.dockwidget.interpreterName.setEnabled(False)
+        else: 
+            self.iface.messageBar().pushMessage("", f"The name of interpreter is required!", level=Qgis.Critical, duration=5)    
+
+
+    def setTileInfoVisible(self, visible):
+        self.dockwidget.tileInfo.setVisible(visible)
+        self.dockwidget.btnNext.setVisible(visible)
+
 
     def run(self):
         """Run method that loads and starts the plugin"""
@@ -222,10 +393,86 @@ class AlertsInspection:
             if self.dockwidget == None:
                 # Create the dockwidget (after translation) and keep reference
                 self.dockwidget = AlertsInspectionDockWidget()
+            
+            self.dockwidget.btnClearSelection.setIcon(QIcon(os.path.dirname(__file__) + "/img/delete.png"))
+            self.dockwidget.logo.setPixmap(QPixmap(os.path.dirname(__file__) + "/img/logo-plugin.png"))
+            self.dockwidget.btnNext.setIcon(QIcon(os.path.dirname(__file__) + "/img/save.png"))
+            self.dockwidget.btnBack.setEnabled(False)
+            self.dockwidget.btnNext.setEnabled(False)
+            self.iface.actionPan().trigger() 
+           
+            connections.xyz(self)
+            self.inspectionController = InspectionController(self)
+            self.workDir = str.split(__file__, "alerts_inspection.py")[0]
+            self.pluginIsActive = True
+            self.canvas = self.iface.mapCanvas()
+            QgsProject.instance().clear()
+           
+
+            # QgsProject.instance().clear()
+            # Check if config file exists, if not create
+            if not os.path.exists(self.workDir + 'config.json'):
+                with open(self.workDir + 'config.json', 'w') as file:
+                    config = {"currentTileIndex": 0, "interpreterName": "", "filePath": "", "polygonsFilePath": "", "deforestationPointsPath": "", "workingDirectory": ""}
+                    json.dump(config, file, sort_keys=True)
+                    file.close()
+            
+            
+            
+            self.setTileInfoVisible(visible=False)
+            self.dockwidget.btnInitInspections.setVisible(False)
+            self.dockwidget.btnClearSelection.setVisible(False)
+            self.dockwidget.tabWidget.setTabEnabled(1, False)
+            self.dockwidget.labelClass.setVisible(False)
+            self.dockwidget.selectedClass.setVisible(False)
+
+            self.openGoogleSatellite()
+            file = self.getConfig('filePath')
+
+            if (file != ""):
+                msg = QMessageBox()
+                msg.setIcon(QMessageBox.Question)
+                msg.setText("Do you want to start a new inspection?")
+                msg.setWindowTitle("ALERTS INSPECTION")
+                msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+                retval = msg.exec_()
+                # 65536 -> No | 16384 -> Yes
+                if (retval == 16384):
+                    self.dockwidget.btnFile.setEnabled(True)
+                    self.dockwidget.btnPolygons.setEnabled(True)
+                    self.dockwidget.btnWorkingDirectory.setEnabled(True)
+                    self.dockwidget.interpreterName.setEnabled(True)
+                    self.dockwidget.tabWidget.setCurrentIndex(0)
+                    self.setConfig(key='polygonsFilePath', value="")
+                    self.setConfig(key='currentTileIndex', value=0)
+                    self.setConfig(key='filePath', value="")
+                    self.setConfig(key='deforestationPointsPath', value="")
+                    self.setConfig(key='workingDirectory', value="")
+                    self.setConfig(key='interpreterName', value="")
+                    
+                else:
+                    self.getDirPath(fromConfig=True)
+                    self.openTilesFile(fromConfig=True)
+                    self.openPolygonsFile(fromConfig=True)
+                    self.dockwidget.interpreterName.setText(self.getConfig('interpreterName').upper())
+                    self.dockwidget.tabWidget.setTabEnabled(1, True)
+                    self.dockwidget.interpreterName.setEnabled(False)
+                    self.dockwidget.btnFile.setEnabled(False)
+                    self.dockwidget.btnPolygons.setEnabled(False)
+                    self.dockwidget.btnWorkingDirectory.setEnabled(False)
+                    self.dockwidget.btnInitInspections.setVisible(False)
+                    self.setTileInfoVisible(visible=True)
+
+
+            self.dockwidget.btnFile.clicked.connect(self.openTilesFile)
+            self.dockwidget.btnPolygons.clicked.connect(self.openPolygonsFile)
+            self.dockwidget.btnWorkingDirectory.clicked.connect(self.getDirPath)
+            self.dockwidget.btnClearSelection.clicked.connect(self.inspectionController.removeSelection)
+            self.dockwidget.btnInitInspections.clicked.connect(self.initInspections)
 
             # connect to provide cleanup on closing of dockwidget
             self.dockwidget.closingPlugin.connect(self.onClosePlugin)
-
+           
             # show the dockwidget
             # TODO: fix to allow choice of dock location
             self.iface.addDockWidget(Qt.RightDockWidgetArea, self.dockwidget)
