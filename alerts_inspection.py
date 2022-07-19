@@ -426,7 +426,6 @@ class AlertsInspection:
             self.dockwidget.labelClass.setVisible(False)
             self.dockwidget.selectedClass.setVisible(False)
 
-            self.openGoogleSatellite()
             file = self.getConfig('filePath')
 
             if (file != ""):
