@@ -332,7 +332,7 @@ class AlertsInspection:
         if (layerPath != ""):
             self.polygonsLayer = QgsVectorLayer(layerPath, 'deforestation_polygons', 'ogr')
             symbol = QgsFillSymbol.createSimple(
-                {'color': '255,224,102,40', 'color_border': 'orange', 'width_border': '0.5', 'style': 'dashed_line'})
+                {'color': '0,0,0,0', 'color_border': 'orange', 'width_border': '0.5', 'style': 'dashed_line'})
             self.polygonsLayer.renderer().setSymbol(symbol)
             self.dockwidget.polygonsFileName.setText(layerPath)
             QgsProject.instance().addMapLayer(self.polygonsLayer)
