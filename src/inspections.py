@@ -7,7 +7,7 @@ from qgis.PyQt.QtCore import QVariant
 from PyQt5 import QtCore
 from qgis.PyQt.QtWidgets import QMessageBox
 from qgis.PyQt.QtGui import QColor, QCursor
-from qgis.core import Qgis, QgsWkbTypes, QgsProject, QgsVectorLayer, QgsSymbol, QgsRuleBasedRenderer, QgsFillSymbol, QgsRectangle, QgsField, QgsFeatureRequest
+from qgis.core import Qgis, QgsWkbTypes, QgsProject, QgsVectorLayer, QgsSymbol, QgsRuleBasedRenderer, QgsLayoutItemMap, QgsField, QgsFeatureRequest
 from .tools import ToolPointer, ClipboardPointer
 from .export import Writer
 import unicodedata
@@ -29,6 +29,14 @@ class InspectionController:
                 "type": "point",
                 "selected": True,
                 "rgb": "0,153,51,255"
+            },
+            {
+                "class": "DEFORESTED BEFORE",
+                "value": 2,
+                "color": "#ffff00",
+                "type": "point",
+                "selected": False,
+                "rgb": "255,255,0,255"
             },
             {
                 "class": "NOT DEFORESTED",
@@ -126,6 +134,7 @@ class InspectionController:
             self.layer.deleteFeature(feature.id())
          
         self.layer.commitChanges()
+        
         canvas = self.parent.iface.mapCanvas()
         tool = ToolPointer(self.parent.iface, self.layer, self)
         canvas.setMapTool(tool)
@@ -143,47 +152,42 @@ class InspectionController:
 
         self.layer = None
         self.tile = None
-        zoomRectangle = None
         tilesFeatures = None
         geom = None
         request = None
-        self.inspectionStartDatetime = datetime.datetime.now()
+
         name = self.parent.getConfig('interpreterName')
 
         self.tile = tile
+
         if name is "":
             name = self.parent.dockwidget.interpreterName.text()
         
         self.interpreterName = self.normalize(name)
 
-        filename =  self.parent.getConfig('deforestationPointsPath')
+        filename = self.parent.getConfig('deforestationPointsPath')
 
         if not path.exists(filename):
-           
             uri = "point?crs=epsg:5880"
             self.layer = QgsVectorLayer(uri, f"deforestation_points_{self.interpreterName}", "memory")
+
+            dataProvider = self.layer.dataProvider()
+            # Enter editing mode
+            self.layer.startEditing()
+
+            # add fields
+            dataProvider.addAttributes( [ QgsField("deforested", QVariant.Int), QgsField("tile_id", QVariant.Int) ] )
+
+            self.layer.commitChanges()   
         else:
-            self.layer = QgsVectorLayer(filename, f"deforestation_points_{self.interpreterName}", 'ogr')
+            self.layer = QgsVectorLayer(filename, f"deforestation_points_{self.interpreterName}", 'ogr')     
 
-        dataProvider = self.layer.dataProvider()
-        # Enter editing mode
-        self.layer.startEditing()
-
-        # add fields
-        dataProvider.addAttributes( [ QgsField("deforested", QVariant.Int), QgsField("tile_id", QVariant.Int) ] )
-
-        self.layer.commitChanges()        
-        request = QgsFeatureRequest().setFilterFids([tile[0]])
-        tilesFeatures = list(self.parent.tilesLayer.getFeatures(request))
-        geom = tilesFeatures[0].geometry()
-        zoomRectangle = QgsRectangle(geom.boundingBox())
+        
+        self.setFeatureColor()
 
         self.layer.selectionChanged.connect(self.removePoints)
-
+            
         QgsProject().instance().addMapLayer(self.layer)
-        self.parent.canvas.setExtent(zoomRectangle)
-
-        self.setFeatureColor()
     
     def setDefaultClass(self, layer):
         layer.startEditing()
@@ -241,70 +245,34 @@ class InspectionController:
             else:
                 self.parent.dockwidget.labelClass.setVisible(False)
 
-            for i in reversed(range(self.parent.dockwidget.layoutClasses.count())): 
-                self.parent.dockwidget.layoutClasses.itemAt(i).widget().setParent(None)
-
-    def layerIsEmpty(self, layer):
-        request = QgsFeatureRequest().setFilterExpression(' "class" is NULL AND "image_date" is NULL ')
-        resultFeatures = layer.getFeatures(request);
-
-        if(layer.featureCount() == len(list(resultFeatures))):
-            return True
-        else:
-            return False
-
-    
-    def sendInspections(self):
-        workingDirectory = self.parent.getConfig('workingDirectory')
-        # layer.saveSldStyle(path.join(workingDirectory, f"{self.parent.typeInspection['_id']}.sld"))
-        # types = (path.join(workingDirectory, f"*_{self.parent.typeInspection['_id']}.gpkg"), f"*_{self.parent.typeInspection['_id']}.sld")
-        files = glob(path.join(workingDirectory, f"*_{self.parent.typeInspection['_id']}.gpkg"))
-           
+            # for i in reversed(range(self.parent.dockwidget.layoutClasses.count())): 
+            #     self.parent.dockwidget.layoutClasses.itemAt(i).widget().setParent(None)
+          
 
     def nextTile(self):
-        layer = None
         index = self.parent.currentTileIndex + 1
         tilesLength = len(self.parent.tiles)
-
-        layer = self.layer
               
-        if(layer):
+        if(self.layer):
             if( index <= tilesLength):
-                endTime = datetime.datetime.now()
-                name = self.parent.getConfig('interpreterName')
-
-                if name is "":
-                    name = self.parent.dockwidget.interpreterName.text()
                 filename =  self.parent.getConfig('deforestationPointsPath');
                 if not path.exists(filename):
-                    Writer(self, layer).gpkg()
+                    Writer(self,  self.layer).gpkg()
 
                 if(index < tilesLength):
                     self.parent.currentTileIndex = index
                     self.parent.setConfig(key='currentTileIndex', value= index)
-                    # QgsProject.instance().removeMapLayer(layer.id())
                     self.parent.configTiles()
-
-            # self.clearContainerClasses()
 
             if(index == tilesLength):
                 self.parent.iface.messageBar().pushMessage("", "Inspection FINISHED!", level=Qgis.Info, duration=15)
-
-                if(self.parent.dockwidget):
-                    self.parent.dockwidget.tileInfo.setText(f"INSPECTION FINISHED!")
-                    self.parent.dockwidget.labelClass.setVisible(False)
-                    self.clearContainerClasses(finished=True)
-
+                self.parent.dockwidget.tileInfo.setText(f"INSPECTION FINISHED!")
+                self.parent.dockwidget.labelClass.setVisible(False)
+                self.clearContainerClasses(finished=True)
                 self.parent.currentTileIndex = 0
-                time.sleep(2)
                 remove(self.parent.workDir + 'config.json')
-                self.parent.onClosePlugin();
+                self.parent.onClosePlugin()
             
-                
-                # button = QPushButton("Send Inpections to Drive", checkable=True)
-                # button.setCursor(QCursor(QtCore.Qt.PointingHandCursor))
-                # button.clicked.connect(self.sendInspections)
-                # self.parent.dockwidget.layoutClasses.addWidget(button)
         else: 
             self.parent.iface.messageBar().pushMessage("", "Something went wrong with the layer, Please close the plugin and try again", level=Qgis.Critical, duration=10)  
         

@@ -21,14 +21,16 @@
  *                                                                         *
  ***************************************************************************/
 """
+from audioop import add
 from os.path import expanduser
 import json
+import time
 import os
 import requests as req
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, Qt
 from qgis.PyQt.QtGui import QIcon, QPixmap
 from qgis.PyQt.QtWidgets import QAction, QFileDialog, QMessageBox
-from qgis.core import Qgis, QgsProject, QgsRasterLayer, QgsVectorLayer, QgsFillSymbol, QgsCoordinateReferenceSystem
+from qgis.core import Qgis, QgsProject, QgsRasterLayer, QgsVectorLayer, QgsFillSymbol, QgsRectangle, QgsFeatureRequest, QgsCoordinateReferenceSystem
 from qgis.PyQt.QtWidgets import QAction
 # Initialize Qt resources from file resources.py
 from .resources import *
@@ -86,7 +88,7 @@ class AlertsInspection:
         self.canvas = None
         self.root = None
         self.group = None
-        self.tiles = None
+        self.tiles = []
         self.currentTileIndex = 0
         self.selectedClass = None
         self.inspectionController = None
@@ -206,7 +208,13 @@ class AlertsInspection:
         self.iface.actionPan().trigger() 
 
         # disconnects
+        self.dockwidget.btnFile.clicked.disconnect(self.openTilesFile)
+        self.dockwidget.btnPolygons.clicked.disconnect(self.openPolygonsFile)
+        self.dockwidget.btnWorkingDirectory.clicked.disconnect(self.getDirPath)
+        self.dockwidget.btnClearSelection.clicked.disconnect(self.inspectionController.removeSelection)
+        self.dockwidget.btnInitInspections.clicked.disconnect(self.initInspections)
         self.dockwidget.closingPlugin.disconnect(self.onClosePlugin)
+        self.dockwidget = None
 
         # remove this statement if dockwidget is to remain
         # for reuse if plugin is reopened
@@ -269,9 +277,18 @@ class AlertsInspection:
             outfile.close()
 
     def configTiles(self):
+    
         tile = self.tiles[self.currentTileIndex]
         self.dockwidget.tileInfo.setText(f"Tile {self.currentTileIndex + 1} of {len(self.tiles)}")
         self.dockwidget.btnClearSelection.setVisible(False)
+
+        request = QgsFeatureRequest().setFilterFids([ tile[0] ])
+        tilesFeatures = list(self.tilesLayer.getFeatures(request))
+        geom = tilesFeatures[0].geometry()
+        self.canvas.waitWhileRendering()
+        self.canvas.setExtent(geom.boundingBox())
+        self.canvas.refresh()
+      
         self.inspectionController.createPointsLayer(tile)
         self.loadClasses()
    
@@ -279,6 +296,7 @@ class AlertsInspection:
     def loadTiles(self):
         """Load tiles from layer"""
         instance = QgsProject.instance()
+
         openLayers = [layer for layer in instance.mapLayers().values()]
         for layer in openLayers:
             if (layer.name() == 'tiles'):
@@ -290,8 +308,6 @@ class AlertsInspection:
        
         if (fromConfig):
             layerPath = self.getConfig('filePath')
-            self.dockwidget.tabWidget.setCurrentIndex(1)
-            self.currentTileIndex = self.getConfig('currentTileIndex')
         else:
             layerPath = str(
                 QFileDialog.getOpenFileName(
@@ -299,10 +315,10 @@ class AlertsInspection:
                     filter='Geopackage (*gpkg)'
                 )[0]
             )
+
         if (layerPath != ""):
             self.tilesLayer = QgsVectorLayer(layerPath, 'tiles', 'ogr')
-            symbol = QgsFillSymbol.createSimple(
-                {'color': '0,0,0,0', 'color_border': 'red', 'width_border': '0.5', 'style': 'dashed'})
+            symbol = QgsFillSymbol.createSimple({'color': '0,0,0,0', 'color_border': 'red', 'width_border': '0.5', 'style': 'dashed'})
             self.tilesLayer.renderer().setSymbol(symbol)
             self.dockwidget.fieldFileName.setText(layerPath)
             QgsProject.instance().addMapLayer(self.tilesLayer)
@@ -310,18 +326,13 @@ class AlertsInspection:
             self.iface.zoomToActiveLayer();
             self.loadTiles()
             self.setConfig(key='filePath', value=layerPath)
-            
-            if(fromConfig):
-                 self.configTiles()
 
     def openPolygonsFile(self, fromConfig=False):
         """Open Polygons file Dialog"""
-        QgsProject.instance().setCrs(QgsCoordinateReferenceSystem(5880))
        
         if (fromConfig):
             layerPath = self.getConfig('polygonsFilePath')
             self.dockwidget.tabWidget.setCurrentIndex(1)
-            self.currentTileIndex = self.getConfig('currentTileIndex')
         else:
             layerPath = str(
                 QFileDialog.getOpenFileName(
@@ -331,12 +342,12 @@ class AlertsInspection:
             )
         if (layerPath != ""):
             self.polygonsLayer = QgsVectorLayer(layerPath, 'deforestation_polygons', 'ogr')
-            symbol = QgsFillSymbol.createSimple(
-                {'color': '0,0,0,0', 'color_border': 'orange', 'width_border': '0.5', 'style': 'dashed_line'})
+            symbol = QgsFillSymbol.createSimple({'color': '0,0,0,0', 'color_border': 'orange', 'width_border': '0.5', 'style': 'dashed_line'})
             self.polygonsLayer.renderer().setSymbol(symbol)
             self.dockwidget.polygonsFileName.setText(layerPath)
             QgsProject.instance().addMapLayer(self.polygonsLayer)
-            self.setConfig(key='polygonsFilePath', value=layerPath)         
+            self.setConfig(key='polygonsFilePath', value=layerPath)      
+               
 
 
     def getDirPath(self, fromConfig=False):
@@ -418,13 +429,13 @@ class AlertsInspection:
                     file.close()
             
             
-            
             self.setTileInfoVisible(visible=False)
             self.dockwidget.btnInitInspections.setVisible(False)
             self.dockwidget.btnClearSelection.setVisible(False)
             self.dockwidget.tabWidget.setTabEnabled(1, False)
             self.dockwidget.labelClass.setVisible(False)
             self.dockwidget.selectedClass.setVisible(False)
+            self.dockwidget.interpreterName.setEnabled(True)
 
             file = self.getConfig('filePath')
 
@@ -450,6 +461,7 @@ class AlertsInspection:
                     self.setConfig(key='interpreterName', value="")
                     
                 else:
+                    self.currentTileIndex = self.getConfig('currentTileIndex')
                     self.getDirPath(fromConfig=True)
                     self.openTilesFile(fromConfig=True)
                     self.openPolygonsFile(fromConfig=True)
@@ -461,7 +473,7 @@ class AlertsInspection:
                     self.dockwidget.btnWorkingDirectory.setEnabled(False)
                     self.dockwidget.btnInitInspections.setVisible(False)
                     self.setTileInfoVisible(visible=True)
-
+                    self.configTiles()  
 
             self.dockwidget.btnFile.clicked.connect(self.openTilesFile)
             self.dockwidget.btnPolygons.clicked.connect(self.openPolygonsFile)
